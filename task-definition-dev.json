@@ -1,0 +1,61 @@
+{
+    "family": "nic-rooms-synapse-dev",
+    "networkMode": "bridge",
+    "containerDefinitions": [
+        {
+            "name": "nic-rooms-synapse",
+            "image": "751489943657.dkr.ecr.eu-central-1.amazonaws.com/nic-rooms-synapse:dev-latest",
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "secretOptions": null,
+                "options": {
+                    "awslogs-group": "/ecs/nic-rooms-synapse-dev",
+                    "awslogs-region": "eu-central-1",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            },
+            "portMappings": [
+                {
+                    "containerPort": 8448,
+                    "hostPort": 8448,
+                    "protocol": "tcp"
+                },
+				{
+                    "containerPort": 8008,
+                    "hostPort": 8008,
+                    "protocol": "tcp"
+                }
+            ],
+            "environment": [
+                {
+                    "name": "NODE_ENV",
+                    "value": "dev"
+                }
+            ],
+            "essential": true,
+            "hostname": "nic-rooms-synapse-dev",
+            "mountPoints": [
+                {
+                    "sourceVolume": "database",
+                    "containerPath": "/data"
+                }
+            ]
+        }
+    ],
+    "volumes": [
+        {
+            "name": "database",
+            "dockerVolumeConfiguration" : {
+                "scope": "shared",
+                "autoprovision": true,
+                "driver": "local",
+                "labels": {
+                    "database": "synapse-database"
+                }
+            }
+        }
+    ],
+    "requiresCompatibilities": ["EC2"],
+    "cpu": "512",
+    "memory": "1024"
+}
