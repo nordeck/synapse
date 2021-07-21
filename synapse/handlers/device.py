@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Collection, Dict, Iterable, List, Optional, Set, Tuple
 
 from synapse.api import errors
 from synapse.api.constants import EventTypes
@@ -28,7 +28,6 @@ from synapse.api.errors import (
 from synapse.logging.opentracing import log_kv, set_tag, trace
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.types import (
-    Collection,
     JsonDict,
     StreamToken,
     UserID,
@@ -453,7 +452,7 @@ class DeviceHandler(DeviceWorkerHandler):
             user_id
         )
 
-        hosts = set()  # type: Set[str]
+        hosts: Set[str] = set()
         if self.hs.is_mine_id(user_id):
             hosts.update(get_domain_from_id(u) for u in users_who_share_room)
             hosts.discard(self.server_name)
@@ -614,20 +613,20 @@ class DeviceListUpdater:
         self._remote_edu_linearizer = Linearizer(name="remote_device_list")
 
         # user_id -> list of updates waiting to be handled.
-        self._pending_updates = (
-            {}
-        )  # type: Dict[str, List[Tuple[str, str, Iterable[str], JsonDict]]]
+        self._pending_updates: Dict[
+            str, List[Tuple[str, str, Iterable[str], JsonDict]]
+        ] = {}
 
         # Recently seen stream ids. We don't bother keeping these in the DB,
         # but they're useful to have them about to reduce the number of spurious
         # resyncs.
-        self._seen_updates = ExpiringCache(
+        self._seen_updates: ExpiringCache[str, Set[str]] = ExpiringCache(
             cache_name="device_update_edu",
             clock=self.clock,
             max_len=10000,
             expiry_ms=30 * 60 * 1000,
             iterable=True,
-        )  # type: ExpiringCache[str, Set[str]]
+        )
 
         # Attempt to resync out of sync device lists every 30s.
         self._resync_retry_in_progress = False
@@ -756,7 +755,7 @@ class DeviceListUpdater:
         """Given a list of updates for a user figure out if we need to do a full
         resync, or whether we have enough data that we can just apply the delta.
         """
-        seen_updates = self._seen_updates.get(user_id, set())  # type: Set[str]
+        seen_updates: Set[str] = self._seen_updates.get(user_id, set())
 
         extremity = await self.store.get_device_list_last_stream_id_for_remote(user_id)
 
@@ -926,6 +925,10 @@ class DeviceListUpdater:
         else:
             cached_devices = await self.store.get_cached_devices_for_user(user_id)
             if cached_devices == {d["device_id"]: d for d in devices}:
+                logging.info(
+                    "Skipping device list resync for %s, as our cache matches already",
+                    user_id,
+                )
                 devices = []
                 ignore_devices = True
 
@@ -941,6 +944,9 @@ class DeviceListUpdater:
             await self.store.update_remote_device_list_cache(
                 user_id, devices, stream_id
             )
+        # mark the cache as valid, whether or not we actually processed any device
+        # list updates.
+        await self.store.mark_remote_user_device_cache_as_valid(user_id)
         device_ids = [device["device_id"] for device in devices]
 
         # Handle cross-signing keys.

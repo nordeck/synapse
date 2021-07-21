@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import inspect
 import logging
+import secrets
 import time
 from typing import Callable, Dict, Iterable, Optional, Tuple, Type, TypeVar, Union
 from unittest.mock import Mock, patch
@@ -139,7 +140,7 @@ class TestCase(unittest.TestCase):
             try:
                 self.assertEquals(attrs[key], getattr(obj, key))
             except AssertionError as e:
-                raise (type(e))("Assert error for '.{}':".format(key)) from e
+                raise (type(e))(f"Assert error for '.{key}':") from e
 
     def assert_dict(self, required, actual):
         """Does a partial assert of a dict.
@@ -247,6 +248,8 @@ class HomeserverTestCase(TestCase):
             config=self.hs.config.server.listeners[0],
             resource=self.resource,
             server_version_string="1",
+            max_request_body_size=1234,
+            reactor=self.reactor,
         )
 
         from tests.rest.client.v1.utils import RestHelper
@@ -517,7 +520,7 @@ class HomeserverTestCase(TestCase):
         if not isinstance(deferred, Deferred):
             return d
 
-        results = []  # type: list
+        results: list = []
         deferred.addBoth(results.append)
 
         self.pump(by=by)
@@ -591,7 +594,15 @@ class HomeserverTestCase(TestCase):
         user_id = channel.json_body["user_id"]
         return user_id
 
-    def login(self, username, password, device_id=None):
+    def login(
+        self,
+        username,
+        password,
+        device_id=None,
+        custom_headers: Optional[
+            Iterable[Tuple[Union[bytes, str], Union[bytes, str]]]
+        ] = None,
+    ):
         """
         Log in a user, and get an access token. Requires the Login API be
         registered.
@@ -602,7 +613,10 @@ class HomeserverTestCase(TestCase):
             body["device_id"] = device_id
 
         channel = self.make_request(
-            "POST", "/_matrix/client/r0/login", json.dumps(body).encode("utf8")
+            "POST",
+            "/_matrix/client/r0/login",
+            json.dumps(body).encode("utf8"),
+            custom_headers=custom_headers,
         )
         self.assertEqual(channel.code, 200, channel.result)
 
@@ -624,7 +638,6 @@ class HomeserverTestCase(TestCase):
             str: The new event's ID.
         """
         event_creator = self.hs.get_event_creation_handler()
-        secrets = self.hs.get_secrets()
         requester = create_requester(user)
 
         event, context = self.get_success(

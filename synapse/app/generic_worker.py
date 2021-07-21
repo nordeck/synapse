@@ -15,7 +15,7 @@
 # limitations under the License.
 import logging
 import sys
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
 
 from twisted.internet import address
 from twisted.web.resource import IResource
@@ -32,7 +32,12 @@ from synapse.api.urls import (
     SERVER_KEY_V2_PREFIX,
 )
 from synapse.app import _base
-from synapse.app._base import register_start
+from synapse.app._base import (
+    handle_startup_exception,
+    max_request_body_size,
+    redirect_stdio_to_logs,
+    register_start,
+)
 from synapse.config._base import ConfigError
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.logger import setup_logging
@@ -55,16 +60,14 @@ from synapse.replication.slave.storage.events import SlavedEventStore
 from synapse.replication.slave.storage.filtering import SlavedFilteringStore
 from synapse.replication.slave.storage.groups import SlavedGroupServerStore
 from synapse.replication.slave.storage.keys import SlavedKeyStore
-from synapse.replication.slave.storage.presence import SlavedPresenceStore
 from synapse.replication.slave.storage.profile import SlavedProfileStore
 from synapse.replication.slave.storage.push_rule import SlavedPushRuleStore
 from synapse.replication.slave.storage.pushers import SlavedPusherStore
 from synapse.replication.slave.storage.receipts import SlavedReceiptsStore
 from synapse.replication.slave.storage.registration import SlavedRegistrationStore
 from synapse.replication.slave.storage.room import RoomStore
-from synapse.replication.slave.storage.transactions import SlavedTransactionStore
 from synapse.rest.admin import register_servlets_for_media_repo
-from synapse.rest.client.v1 import events, login, room
+from synapse.rest.client.v1 import events, login, presence, room
 from synapse.rest.client.v1.initial_sync import InitialSyncRestServlet
 from synapse.rest.client.v1.profile import (
     ProfileAvatarURLRestServlet,
@@ -105,12 +108,14 @@ from synapse.server import HomeServer
 from synapse.storage.databases.main.censor_events import CensorEventsStore
 from synapse.storage.databases.main.client_ips import ClientIpWorkerStore
 from synapse.storage.databases.main.e2e_room_keys import EndToEndRoomKeyStore
+from synapse.storage.databases.main.lock import LockStore
 from synapse.storage.databases.main.media_repository import MediaRepositoryStore
 from synapse.storage.databases.main.metrics import ServerMetricsStore
 from synapse.storage.databases.main.monthly_active_users import (
     MonthlyActiveUsersWorkerStore,
 )
-from synapse.storage.databases.main.search import SearchWorkerStore
+from synapse.storage.databases.main.presence import PresenceStore
+from synapse.storage.databases.main.search import SearchStore
 from synapse.storage.databases.main.stats import StatsStore
 from synapse.storage.databases.main.transactions import TransactionWorkerStore
 from synapse.storage.databases.main.ui_auth import UIAuthWorkerStore
@@ -119,26 +124,6 @@ from synapse.util.httpresourcetree import create_resource_tree
 from synapse.util.versionstring import get_version_string
 
 logger = logging.getLogger("synapse.app.generic_worker")
-
-
-class PresenceStatusStubServlet(RestServlet):
-    """If presence is disabled this servlet can be used to stub out setting
-    presence status.
-    """
-
-    PATTERNS = client_patterns("/presence/(?P<user_id>[^/]*)/status")
-
-    def __init__(self, hs):
-        super().__init__()
-        self.auth = hs.get_auth()
-
-    async def on_GET(self, request, user_id):
-        await self.auth.get_user_by_req(request)
-        return 200, {"presence": "offline"}
-
-    async def on_PUT(self, request, user_id):
-        await self.auth.get_user_by_req(request)
-        return 200, {}
 
 
 class KeyUploadServlet(RestServlet):
@@ -241,6 +226,7 @@ class GenericWorkerSlavedStore(
     StatsStore,
     UIAuthWorkerStore,
     EndToEndRoomKeyStore,
+    PresenceStore,
     SlavedDeviceInboxStore,
     SlavedDeviceStore,
     SlavedReceiptsStore,
@@ -256,16 +242,15 @@ class GenericWorkerSlavedStore(
     DirectoryStore,
     SlavedApplicationServiceStore,
     SlavedRegistrationStore,
-    SlavedTransactionStore,
     SlavedProfileStore,
     SlavedClientIpStore,
-    SlavedPresenceStore,
     SlavedFilteringStore,
     MonthlyActiveUsersWorkerStore,
     MediaRepositoryStore,
     ServerMetricsStore,
-    SearchWorkerStore,
+    SearchStore,
     TransactionWorkerStore,
+    LockStore,
     BaseSlavedStore,
 ):
     pass
@@ -285,7 +270,7 @@ class GenericWorkerServer(HomeServer):
             site_tag = port
 
         # We always include a health resource.
-        resources = {"/health": HealthResource()}  # type: Dict[str, IResource]
+        resources: Dict[str, IResource] = {"/health": HealthResource()}
 
         for res in listener_config.http_options.resources:
             for name in res.names:
@@ -327,10 +312,7 @@ class GenericWorkerServer(HomeServer):
 
                     user_directory.register_servlets(self, resource)
 
-                    # If presence is disabled, use the stub servlet that does
-                    # not allow sending presence
-                    if not self.config.use_presence:
-                        PresenceStatusStubServlet(self).register(resource)
+                    presence.register_servlets(self, resource)
 
                     groups.register_servlets(self, resource)
 
@@ -379,6 +361,10 @@ class GenericWorkerServer(HomeServer):
                 if name == "replication":
                     resources[REPLICATION_PREFIX] = ReplicationRestResource(self)
 
+        # Attach additional resources registered by modules.
+        resources.update(self._module_web_resources)
+        self._module_web_resources_consumed = True
+
         root_resource = create_resource_tree(resources, OptionsResource())
 
         _base.listen_tcp(
@@ -390,14 +376,16 @@ class GenericWorkerServer(HomeServer):
                 listener_config,
                 root_resource,
                 self.version_string,
+                max_request_body_size=max_request_body_size(self.config),
+                reactor=self.get_reactor(),
             ),
             reactor=self.get_reactor(),
         )
 
         logger.info("Synapse worker now listening on port %d", port)
 
-    def start_listening(self, listeners: Iterable[ListenerConfig]):
-        for listener in listeners:
+    def start_listening(self):
+        for listener in self.config.worker_listeners:
             if listener.type == "http":
                 self._listen_http(listener)
             elif listener.type == "manhole":
@@ -407,10 +395,8 @@ class GenericWorkerServer(HomeServer):
             elif listener.type == "metrics":
                 if not self.config.enable_metrics:
                     logger.warning(
-                        (
-                            "Metrics listener configured, but "
-                            "enable_metrics is not True!"
-                        )
+                        "Metrics listener configured, but "
+                        "enable_metrics is not True!"
                     )
                 else:
                     _base.listen_metrics(listener.bind_addresses, listener.port)
@@ -475,6 +461,10 @@ def start(config_options):
         config.server.update_user_directory = False
 
     synapse.events.USE_FROZEN_DICTS = config.use_frozen_dicts
+    synapse.util.caches.TRACK_MEMORY_USAGE = config.caches.track_memory_usage
+
+    if config.server.gc_seconds:
+        synapse.metrics.MIN_TIME_BETWEEN_GCS = config.server.gc_seconds
 
     hs = GenericWorkerServer(
         config.server_name,
@@ -484,13 +474,20 @@ def start(config_options):
 
     setup_logging(hs, config, use_worker_options=True)
 
-    hs.setup()
+    try:
+        hs.setup()
 
-    # Ensure the replication streamer is always started in case we write to any
-    # streams. Will no-op if no streams can be written to by this worker.
-    hs.get_replication_streamer()
+        # Ensure the replication streamer is always started in case we write to any
+        # streams. Will no-op if no streams can be written to by this worker.
+        hs.get_replication_streamer()
+    except Exception as e:
+        handle_startup_exception(e)
 
-    register_start(_base.start, hs, config.worker_listeners)
+    register_start(_base.start, hs)
+
+    # redirect stdio to the logs, if configured.
+    if not hs.config.no_redirect_stdio:
+        redirect_stdio_to_logs()
 
     _base.start_worker_reactor("synapse-generic-worker", config)
 
